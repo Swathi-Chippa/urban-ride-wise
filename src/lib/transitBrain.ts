@@ -1,61 +1,48 @@
 import { supabase } from "./supabase";
 
-export interface CommuteIntentInput {
+export type CityDisruptionType =
+  "bandh" | "waterlogging" | "roadwork" | "vip_movement" | "exam_surge";
+
+export interface CommuterIntentData {
+  phone?: string;
+  name?: string;
   userType: string;
   routeId: string;
   timeSlot: string;
 }
 
-export interface DemandMetrics {
-  routeId: string;
-  timeSlot: string;
-  activeRegistrations: number;
-  threshold: number;
-  highDemand: boolean;
-}
-
 export interface CommuteIntentResult {
-  success: boolean;
-  metrics: DemandMetrics;
+  totalDemand: number;
+  thresholdCrossed: boolean;
+  metrics: {
+    totalDemand: number;
+    activeBusesCount: number;
+    routeId: string;
+    timeSlot: string;
+    activeRegistrations: number;
+    threshold: number;
+    highDemand: boolean;
+  };
   triggerStatus: string;
 }
 
-export type CityDisruptionType =
-  "bandh" | "waterlogging" | "roadwork" | "vip_movement" | "exam_surge";
-
 export interface CitySignalResult {
-  zone: string;
-  predictedDemand: number;
-  disruption: CityDisruptionType | string;
-  standbyUnitsDispatched: boolean;
-}
-
-export interface ConductorShiftData {
-  conductorId: string;
-  name: string;
-  busNumber: string;
-  routeId: string;
-}
-
-export interface ConductorShiftResult {
   success: boolean;
   message: string;
-  busNumber: string;
-  routeId: string;
+  zone: string;
+  predictedDemand: number;
+  standbyUnitsDispatched: boolean;
 }
-
-export type OccupancyStatus = "Low" | "Moderate" | "Overcrowded (Surge)";
 
 export interface FleetActionResult {
   success: boolean;
   message: string;
 }
 
-const COMMUTER_DEMAND_THRESHOLD = 150;
-const localCommuteIntents: CommuteIntentInput[] = [];
-const localDemandCounts = new Map<string, number>([["Route 218|Morning Peak", 184]]);
+const DEMAND_THRESHOLD = 150;
+const localDemand = new Map<string, number>([["Route 218|Morning Peak", 184]]);
 
-const cityDisruptionSignalNames: Record<CityDisruptionType, string> = {
+const signalNames: Partial<Record<CityDisruptionType, string>> = {
   bandh: "Bandh / Strike",
   waterlogging: "Heavy Rain / Waterlogging",
   roadwork: "Road Work / Construction Detour",
@@ -63,202 +50,179 @@ const cityDisruptionSignalNames: Record<CityDisruptionType, string> = {
   exam_surge: "College Exam / Event Demand Surge",
 };
 
+async function repositionStandbyBus(routeId: string): Promise<boolean> {
+  const { data: standbyBuses, error: selectError } = await supabase
+    .from("buses")
+    .select("id")
+    .eq("status", "Standby")
+    .limit(1);
+  const standbyId = standbyBuses?.[0]?.id;
+  if (selectError || !standbyId) return false;
+
+  const { error: updateError } = await supabase
+    .from("buses")
+    .update({ status: "Repositioning", route_id: routeId, updated_at: new Date().toISOString() })
+    .eq("id", standbyId);
+  return !updateError;
+}
+
 export async function processCitySignal(
-  signalName: CityDisruptionType | string,
+  signalName: CityDisruptionType,
   isActive: boolean,
 ): Promise<CitySignalResult | null> {
-  const dbSignalName =
-    signalName in cityDisruptionSignalNames
-      ? cityDisruptionSignalNames[signalName as CityDisruptionType]
-      : signalName;
   try {
-    // 1. Fetch the triggered signal metadata
+    const databaseSignalName = signalNames[signalName] ?? signalName;
     const { data: signal, error: signalError } = await supabase
       .from("city_signals")
-      .select("*")
-      .eq("signal_name", dbSignalName)
+      .select("zone, multiplier")
+      .eq("signal_name", databaseSignalName)
       .single();
+    if (signalError || !signal) return null;
 
-    if (signalError || !signal) {
-      console.error("Error fetching city signal:", signalError);
-      return null;
-    }
-
-    // 2. Update signal active status
-    await supabase.from("city_signals").update({ is_active: isActive }).eq("id", signal.id);
-
-    // 3. Fetch corresponding route baseline demand
     const { data: route, error: routeError } = await supabase
       .from("routes")
-      .select("*")
+      .select("id, baseline_demand")
       .eq("name", signal.zone)
       .single();
+    if (routeError || !route) return null;
 
-    if (routeError || !route) {
-      console.error("Error fetching route:", routeError);
-      return null;
-    }
-
-    // 4. Calculate predicted surge demand using AI signal multiplier
-    const newPredictedDemand = isActive
+    const predictedDemand = isActive
       ? Math.round(route.baseline_demand * signal.multiplier)
       : route.baseline_demand;
-
-    // 5. Update demand prediction in database
     await supabase
-      .from("routes")
-      .update({ predicted_demand: newPredictedDemand })
-      .eq("id", route.id);
-
-    // 6. Autonomous Action: Reposition standby buses if demand surges > 150
-    let standbyUnitsDispatched = false;
-    if (newPredictedDemand > 150) {
-      const { error: dispatchError } = await supabase
-        .from("buses")
-        .update({ status: "Repositioning" })
-        .eq("status", "Standby");
-      standbyUnitsDispatched = !dispatchError;
-    }
+      .from("city_signals")
+      .update({ is_active: isActive })
+      .eq("signal_name", databaseSignalName);
+    await supabase.from("routes").update({ predicted_demand: predictedDemand }).eq("id", route.id);
+    const standbyUnitsDispatched =
+      predictedDemand > DEMAND_THRESHOLD ? await repositionStandbyBus(signal.zone) : false;
 
     return {
+      success: true,
+      message: `${databaseSignalName} ${isActive ? "activated" : "deactivated"}.`,
       zone: signal.zone,
-      predictedDemand: newPredictedDemand,
-      disruption: signalName,
+      predictedDemand,
       standbyUnitsDispatched,
     };
-  } catch (err) {
-    console.error("Unexpected error in processCitySignal:", err);
+  } catch (error) {
+    console.error("Error processing city signal:", error);
     return null;
   }
 }
 
+export async function registerCommuteIntent(
+  data: CommuterIntentData,
+): Promise<CommuteIntentResult> {
+  const demandKey = `${data.routeId}|${data.timeSlot}`;
+  let totalDemand: number | null = null;
+  try {
+    const { error: insertError } = await supabase.from("commuter_intent").insert({
+      phone: data.phone ?? `ANON-${Date.now()}`,
+      passenger_name: data.name ?? "Anonymous Rider",
+      user_type: data.userType,
+      route_id: data.routeId,
+      time_slot: data.timeSlot,
+    });
+    if (!insertError) {
+      const { count, error: countError } = await supabase
+        .from("commuter_intent")
+        .select("id", { count: "exact", head: true })
+        .eq("route_id", data.routeId)
+        .eq("time_slot", data.timeSlot);
+      if (!countError && typeof count === "number") totalDemand = count;
+    }
+  } catch (error) {
+    console.warn("Using local commuter intent fallback:", error);
+  }
+
+  if (totalDemand === null) {
+    totalDemand = (localDemand.get(demandKey) ?? 0) + 1;
+    localDemand.set(demandKey, totalDemand);
+  }
+
+  const thresholdCrossed = totalDemand > DEMAND_THRESHOLD;
+  const standbyRepositioned = thresholdCrossed ? await repositionStandbyBus(data.routeId) : false;
+  return {
+    totalDemand,
+    thresholdCrossed,
+    metrics: {
+      totalDemand,
+      activeBusesCount: thresholdCrossed ? 2 : 1,
+      routeId: data.routeId,
+      timeSlot: data.timeSlot,
+      activeRegistrations: totalDemand,
+      threshold: DEMAND_THRESHOLD,
+      highDemand: thresholdCrossed,
+    },
+    triggerStatus: thresholdCrossed
+      ? standbyRepositioned
+        ? "CRITICAL DEMAND THRESHOLD REACHED (>150) — Standby Bus Repositioned!"
+        : "CRITICAL DEMAND THRESHOLD REACHED (>150) — RTC Depot notified."
+      : "Normal Route Demand Level",
+  };
+}
+
 export async function reportConductorEvent(
   busNumber: string,
-  eventType: "TRIP_START" | "BREAKDOWN" | "ROAD_BLOCK" | "END_SHIFT",
-) {
+  eventType: "TRIP_START" | "BREAKDOWN" | "END_SHIFT",
+  conductorId?: string,
+): Promise<FleetActionResult> {
   try {
     if (eventType === "TRIP_START") {
-      // Mark bus active & conductor-verified
       const { error } = await supabase
         .from("buses")
-        .update({ status: "Active" })
-        .eq("bus_number", busNumber);
-
-      if (error) throw error;
-
-      return {
-        success: true,
-        message: `[Conductor Verification]: Trip started for Bus ${busNumber}. Status flipped to Verified Live.`,
-      };
-    }
-
-    if (eventType === "BREAKDOWN") {
-      // 1. Mark broken-down bus as inactive / standby
-      const { error: breakdownErr } = await supabase
-        .from("buses")
-        .update({ status: "Standby" })
-        .eq("bus_number", busNumber);
-
-      if (breakdownErr) throw breakdownErr;
-
-      // 2. Auto-dispatch backup bus from RTC depot
-      const { error: dispatchErr } = await supabase
-        .from("buses")
-        .update({ status: "Repositioning" })
-        .eq("status", "Standby")
-        .limit(1);
-
-      if (dispatchErr) {
-        console.warn("Could not auto-dispatch standby bus:", dispatchErr);
-      }
-
-      return {
-        success: true,
-        message: `[ALERT]: Breakdown reported on Bus ${busNumber}. Backup fleet auto-dispatched by RTC Depot!`,
-      };
-    }
-
-    if (eventType === "ROAD_BLOCK") {
-      const { error } = await supabase
-        .from("buses")
-        .update({ status: "Road Block Alert" })
+        .update({
+          status: "Active",
+          is_verified: true,
+          conductor_id: conductorId ?? "COND-UNKNOWN",
+          updated_at: new Date().toISOString(),
+        })
         .eq("bus_number", busNumber);
       if (error) throw error;
-      return {
-        success: true,
-        message: `[ALERT]: Road block reported for Bus ${busNumber}. RTC routing desk notified.`,
-      };
+      return { success: true, message: `Bus ${busNumber} is Active and CONDUCTOR VERIFIED LIVE.` };
     }
 
     if (eventType === "END_SHIFT") {
       const { error } = await supabase
         .from("buses")
-        .update({ status: "Standby" })
+        .update({ status: "Unverified", is_verified: false, updated_at: new Date().toISOString() })
         .eq("bus_number", busNumber);
       if (error) throw error;
-      return {
-        success: true,
-        message: `[Conductor]: Shift ended for Bus ${busNumber}. Bus returned to standby.`,
-      };
+      return { success: true, message: `Shift ended for ${busNumber}; bus is Unverified.` };
     }
 
-    return { success: false, message: "Unknown conductor event type." };
+    const { error: breakdownError } = await supabase
+      .from("buses")
+      .update({ status: "Breakdown", is_verified: false, updated_at: new Date().toISOString() })
+      .eq("bus_number", busNumber);
+    if (breakdownError) throw breakdownError;
+    const standbyRepositioned = await repositionStandbyBus("Route 218");
+    return {
+      success: true,
+      message: standbyRepositioned
+        ? `Breakdown reported for ${busNumber}; standby replacement repositioned.`
+        : `Breakdown reported for ${busNumber}; RTC Depot notified.`,
+    };
   } catch (error) {
     console.error("Error reporting conductor event:", error);
-    return { success: false, message: "Failed to record conductor event in database." };
-  }
-}
-
-export async function registerConductorShift(
-  data: ConductorShiftData,
-): Promise<ConductorShiftResult> {
-  try {
-    const { error: busError } = await supabase
-      .from("buses")
-      .update({ status: "Active", verification_status: "Verified" })
-      .eq("bus_number", data.busNumber);
-    if (busError) throw busError;
-
-    const { error: shiftError } = await supabase.from("conductor_shifts").insert({
-      conductor_id: data.conductorId,
-      conductor_name: data.name,
-      bus_number: data.busNumber,
-      route_id: data.routeId,
-      status: "Active",
-    });
-    if (shiftError) throw shiftError;
-
-    return {
-      success: true,
-      message: `[Conductor Verification]: ${data.name} registered. Bus ${data.busNumber} is Verified Live.`,
-      busNumber: data.busNumber,
-      routeId: data.routeId,
-    };
-  } catch (error) {
-    console.warn("Conductor shift stored in local session fallback:", error);
-    return {
-      success: true,
-      message: `[Local Verification]: ${data.name} registered. Bus ${data.busNumber} is Verified Live.`,
-      busNumber: data.busNumber,
-      routeId: data.routeId,
-    };
+    return { success: false, message: "Unable to update the bus in Supabase." };
   }
 }
 
 export async function updateBusOccupancy(
   busNumber: string,
-  occupancy: OccupancyStatus,
+  occupancy: "Low" | "Moderate" | "Overcrowded" | "Overcrowded (Surge)",
 ): Promise<FleetActionResult> {
   try {
     const { error } = await supabase
       .from("buses")
-      .update({ occupancy_status: occupancy })
+      .update({ occupancy, updated_at: new Date().toISOString() })
       .eq("bus_number", busNumber);
     if (error) throw error;
-    return { success: true, message: `Bus ${busNumber} occupancy updated to ${occupancy}.` };
+    return { success: true, message: `Live occupancy updated to ${occupancy}.` };
   } catch (error) {
-    console.warn("Bus occupancy stored in local session fallback:", error);
-    return { success: true, message: `Local occupancy update: ${occupancy}.` };
+    console.error("Error updating occupancy:", error);
+    return { success: false, message: "Unable to update live occupancy in Supabase." };
   }
 }
 
@@ -269,76 +233,16 @@ export async function manuallyAllocateBus(
   try {
     const { error } = await supabase
       .from("buses")
-      .update({ status: "Repositioning", assigned_route: targetRoute })
+      .update({
+        status: "Repositioning",
+        route_id: targetRoute,
+        updated_at: new Date().toISOString(),
+      })
       .eq("bus_number", busNumber);
     if (error) throw error;
-    return { success: true, message: `Bus ${busNumber} allocated to ${targetRoute}.` };
+    return { success: true, message: `${busNumber} allocated to ${targetRoute}.` };
   } catch (error) {
-    console.warn("Manual allocation stored in local session fallback:", error);
-    return { success: true, message: `Local allocation queued: ${busNumber} → ${targetRoute}.` };
+    console.error("Error allocating bus:", error);
+    return { success: false, message: "Unable to allocate bus in Supabase." };
   }
-}
-
-export async function registerCommuteIntent(
-  passengerData: CommuteIntentInput,
-): Promise<CommuteIntentResult> {
-  let activeRegistrations: number | null = null;
-
-  try {
-    const { error: insertError } = await supabase.from("commuter_intent").insert({
-      user_type: passengerData.userType,
-      route_id: passengerData.routeId,
-      time_slot: passengerData.timeSlot,
-    });
-
-    if (!insertError) {
-      const { count, error: countError } = await supabase
-        .from("commuter_intent")
-        .select("id", { count: "exact", head: true })
-        .eq("route_id", passengerData.routeId)
-        .eq("time_slot", passengerData.timeSlot);
-
-      if (!countError && typeof count === "number") activeRegistrations = count;
-    }
-  } catch (error) {
-    console.warn("Using local commuter intent fallback:", error);
-  }
-
-  if (activeRegistrations === null) {
-    localCommuteIntents.push(passengerData);
-    const demandKey = `${passengerData.routeId}|${passengerData.timeSlot}`;
-    activeRegistrations = (localDemandCounts.get(demandKey) ?? 0) + 1;
-    localDemandCounts.set(demandKey, activeRegistrations);
-  }
-
-  const highDemand = activeRegistrations > COMMUTER_DEMAND_THRESHOLD;
-  let triggerStatus = "Demand recorded; no standby allocation required.";
-
-  if (highDemand) {
-    try {
-      const { error } = await supabase
-        .from("buses")
-        .update({ status: "Repositioning" })
-        .eq("status", "Standby")
-        .limit(1);
-
-      if (error) throw error;
-      triggerStatus = "High demand detected; standby bus marked Repositioning.";
-    } catch (error) {
-      console.warn("Standby allocation logged locally:", error);
-      triggerStatus = "High demand detected; RTC Depot notified for extra bus allocation.";
-    }
-  }
-
-  return {
-    success: true,
-    metrics: {
-      routeId: passengerData.routeId,
-      timeSlot: passengerData.timeSlot,
-      activeRegistrations,
-      threshold: COMMUTER_DEMAND_THRESHOLD,
-      highDemand,
-    },
-    triggerStatus,
-  };
 }
