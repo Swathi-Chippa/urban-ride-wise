@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { OperatorView } from "@/components/OperatorView";
 import { PassengerView } from "@/components/PassengerView";
+import { ConductorView } from "@/components/ConductorView";
 import {
   BASE_LOG,
   SIGNAL_LOG,
@@ -12,17 +13,17 @@ import {
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "TransitBrain AI — City Transit Optimization" },
+      { title: "BusMitra AI — Conductor-Verified Transit Intelligence" },
       {
         name: "description",
         content:
-          "Operator dashboard and passenger app for AI-optimized city bus routing: live demand heatmaps, signal simulation, and least-crowded bus recommendations.",
+          "Conductor-verified bus tracking, automated RTC depot fleet optimization, and proactive student transit demand management.",
       },
-      { property: "og:title", content: "TransitBrain AI — City Transit Optimization" },
+      { property: "og:title", content: "BusMitra AI — Transit Intelligence" },
       {
         property: "og:description",
         content:
-          "Simulate city signals, watch AI agents re-route buses, and get the least-crowded ride recommendation.",
+          "Verify trip status with conductors, dispatch backup fleets automatically from the depot, and eliminate student transit delays.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -36,7 +37,7 @@ function timeNow() {
 }
 
 function Index() {
-  const [view, setView] = useState<"operator" | "passenger">("operator");
+  const [view, setView] = useState<"student" | "conductor" | "depot">("student");
   const [active, setActive] = useState<SignalId[]>([]);
   const [log, setLog] = useState<LogEntry[]>(BASE_LOG);
 
@@ -70,38 +71,49 @@ function Index() {
         <div className="max-w-[1440px] mx-auto px-6 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="size-9 rounded-xl bg-lime grid place-items-center">
-              <span className="font-display font-bold text-ink text-lg">T</span>
+              <span className="font-display font-bold text-ink text-lg">🚌</span>
             </div>
             <div>
               <p className="font-display font-bold text-lg leading-none tracking-tight">
-                TransitBrain <span className="text-lime">AI</span>
+                BusMitra <span className="text-lime">AI</span>
               </p>
               <p className="text-[11px] text-white/40 -mt-0.5">
-                City Transit Optimization
+                Verified Transit Optimization
               </p>
             </div>
           </div>
 
+          {/* 3-Role View Navigation */}
           <div className="flex items-center gap-1 bg-panel rounded-full p-1 border border-white/10">
             <button
-              onClick={() => setView("operator")}
+              onClick={() => setView("student")}
               className={
-                view === "operator"
-                  ? "px-5 py-2 rounded-full bg-lime text-ink font-display font-semibold text-sm"
-                  : "px-5 py-2 rounded-full text-white/60 font-display font-semibold text-sm hover:text-white"
+                view === "student"
+                  ? "px-4 py-1.5 rounded-full bg-lime text-ink font-display font-semibold text-xs transition-all"
+                  : "px-4 py-1.5 rounded-full text-white/60 font-display font-semibold text-xs hover:text-white transition-all"
               }
             >
-              Operator View
+              🎓 Student App
             </button>
             <button
-              onClick={() => setView("passenger")}
+              onClick={() => setView("conductor")}
               className={
-                view === "passenger"
-                  ? "px-5 py-2 rounded-full bg-lime text-ink font-display font-semibold text-sm"
-                  : "px-5 py-2 rounded-full text-white/60 font-display font-semibold text-sm hover:text-white"
+                view === "conductor"
+                  ? "px-4 py-1.5 rounded-full bg-lime text-ink font-display font-semibold text-xs transition-all"
+                  : "px-4 py-1.5 rounded-full text-white/60 font-display font-semibold text-xs hover:text-white transition-all"
               }
             >
-              Passenger View
+              🎫 Conductor Portal
+            </button>
+            <button
+              onClick={() => setView("depot")}
+              className={
+                view === "depot"
+                  ? "px-4 py-1.5 rounded-full bg-lime text-ink font-display font-semibold text-xs transition-all"
+                  : "px-4 py-1.5 rounded-full text-white/60 font-display font-semibold text-xs hover:text-white transition-all"
+              }
+            >
+              🏢 RTC Depot
             </button>
           </div>
 
@@ -113,10 +125,10 @@ function Index() {
       </header>
 
       <main className="max-w-[1440px] mx-auto px-6 py-6">
-        {view === "operator" ? (
+        {view === "student" && <PassengerView active={active} />}
+        {view === "conductor" && <ConductorView />}
+        {view === "depot" && (
           <OperatorView active={active} toggle={toggle} log={log} />
-        ) : (
-          <PassengerView active={active} />
         )}
       </main>
     </div>
