@@ -1,5 +1,6 @@
-import { useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { registerCommuteIntent, type CommuteIntentResult } from "@/lib/transitBrain";
+import { supabase } from "@/lib/supabase";
 
 export interface PassengerViewProps {
   active?: string[];
@@ -19,6 +20,23 @@ export interface FeedbackReport {
   rating: number;
   comments: string;
   submittedAt: string;
+}
+export interface LiveBus {
+  id: string;
+  name: string;
+  origin: string;
+  destination: string;
+  scheduled: string;
+  actual: string;
+  delay: string;
+  busNo: string;
+  eta: string;
+  crowdLevel: string;
+  crowdBadge: string;
+  recommended: boolean;
+  isVerified?: boolean;
+  is_verified: boolean;
+  occupancy: string;
 }
 
 const userCategories = ["Student", "Working Professional", "Daily Commuter"];
@@ -46,6 +64,8 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
     timeSlot: timeSlotChoices[0]!,
   });
   const [demand, setDemand] = useState<CommuteIntentResult["metrics"]>({
+    totalDemand: 184,
+    activeBusesCount: 2,
     routeId: "Route 218",
     timeSlot: "Morning Peak",
     activeRegistrations: 184,
@@ -65,7 +85,7 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
     comments: "",
   });
 
-  const routes = [
+  const [routes, setRoutes] = useState<LiveBus[]>([
     {
       id: "218",
       name: "Route 218 · Express",
@@ -75,6 +95,8 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
       actual: "08:32 AM",
       delay: "+12 MIN DELAY",
       isVerified: true,
+      is_verified: true,
+      occupancy: "High",
       busNo: "TS09Z1234",
       eta: "8 min",
       crowdLevel: "High Crowding Predicted (88%)",
@@ -90,13 +112,68 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
       actual: "08:26 AM",
       delay: "ON TIME",
       isVerified: false,
+      is_verified: false,
+      occupancy: "Moderate",
       busNo: "TS09Z5678",
       eta: "14 min",
       crowdLevel: "Moderate Crowding (45%)",
       crowdBadge: "medium",
       recommended: false,
     },
-  ];
+  ]);
+
+  const fetchBusesAndDemand = useCallback(async () => {
+    try {
+      const { data: buses } = await supabase.from("buses").select("*");
+      if (buses?.length) {
+        setRoutes((current) =>
+          current.map((bus) => {
+            const liveBus = buses.find((row) => row.bus_number === bus.busNo) as
+              { is_verified?: boolean; occupancy?: string } | undefined;
+            return liveBus
+              ? {
+                  ...bus,
+                  isVerified: liveBus.is_verified === true,
+                  is_verified: liveBus.is_verified === true,
+                  occupancy: liveBus.occupancy ?? bus.occupancy,
+                }
+              : bus;
+          }),
+        );
+      }
+
+      const { count } = await supabase
+        .from("commuter_intent")
+        .select("id", { count: "exact", head: true })
+        .eq("route_id", demand.routeId);
+      if (typeof count === "number") {
+        setDemand((current) => ({
+          ...current,
+          totalDemand: count,
+          activeRegistrations: count,
+          highDemand: count > current.threshold,
+        }));
+      }
+    } catch (error) {
+      console.warn("Live bus fetch unavailable; retaining current view:", error);
+    }
+  }, [demand.routeId]);
+
+  useEffect(() => {
+    void fetchBusesAndDemand();
+    const channel = supabase
+      .channel("public:buses-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "buses" },
+        () => void fetchBusesAndDemand(),
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [fetchBusesAndDemand]);
 
   function openRegistration() {
     if (profile) setProfileForm(profile);
@@ -244,7 +321,7 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
                   </span>
                 )}
                 <span
-                  className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${bus.isVerified ? "bg-lime/20 text-lime border-lime/30" : "bg-white/10 text-white/60 border-white/10"}`}
+                  className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${bus.is_verified ? "bg-lime/20 text-lime border-lime/30" : "bg-white/10 text-white/60 border-white/10"}`}
                 >
                   {bus.isVerified ? "● CONDUCTOR VERIFIED LIVE" : "○ UNVERIFIED SCHEDULE"}
                 </span>
@@ -289,7 +366,7 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
                 <span
                   className={`text-xs font-semibold ${bus.crowdBadge === "high" ? "text-amber" : "text-lime"}`}
                 >
-                  {bus.crowdLevel}
+                  {bus.occupancy || bus.crowdLevel}
                 </span>
               </div>
               <button
