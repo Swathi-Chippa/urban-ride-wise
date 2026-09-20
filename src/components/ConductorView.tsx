@@ -8,33 +8,64 @@ export function ConductorView() {
   const [busNumber, setBusNumber] = useState("TS09Z1234");
   const [routeId, setRouteId] = useState("Route 218");
   const [occupancy, setOccupancy] = useState<"Low" | "Moderate" | "Overcrowded">("Low");
+  const [preTripConfirmed, setPreTripConfirmed] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
 
   const handleStartShift = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!employeeId || !busNumber) return;
+    if (!employeeId || !busNumber || !preTripConfirmed) return;
 
-    await reportConductorEvent(busNumber, "TRIP_START", employeeId);
+    const result = await reportConductorEvent(busNumber, "TRIP_START", employeeId, routeId);
+    console.log("[ConductorView] TRIP_START result:", result);
+    if (!result.success) {
+      setErrorMessage(result.message);
+      return;
+    }
+    setErrorMessage("");
     setIsShiftActive(true);
   };
 
   const handleOccupancyChange = async (level: "Low" | "Moderate" | "Overcrowded") => {
+    const result = await updateBusOccupancy(busNumber, level);
+    if (!result.success) {
+      setErrorMessage(result.message);
+      return;
+    }
+    setErrorMessage("");
     setOccupancy(level);
-    await updateBusOccupancy(busNumber, level);
   };
 
   const handleBreakdown = async () => {
-    await reportConductorEvent(busNumber, "BREAKDOWN", employeeId);
+    const result = await reportConductorEvent(busNumber, "BREAKDOWN", employeeId);
+    console.log("[ConductorView] BREAKDOWN result:", result);
+    if (!result.success) {
+      setErrorMessage(result.message);
+      return;
+    }
+    setErrorMessage("");
     alert("Emergency Breakdown reported. Replacement fleet dispatched by Depot.");
   };
 
   const handleEndShift = async () => {
-    await reportConductorEvent(busNumber, "END_SHIFT", employeeId);
+    const result = await reportConductorEvent(busNumber, "END_SHIFT", employeeId);
+    console.log("[ConductorView] END_SHIFT result:", result);
+    if (!result.success) {
+      setErrorMessage(result.message);
+      return;
+    }
+    setErrorMessage("");
     setIsShiftActive(false);
   };
 
   return (
     <div className="p-6 bg-panel text-white rounded-xl border border-white/10 space-y-6">
       <h2 className="text-xl font-bold text-lime">🎫 Conductor Shift Verification Portal</h2>
+
+      {errorMessage && (
+        <div role="alert" className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+          {errorMessage}
+        </div>
+      )}
 
       {!isShiftActive ? (
         <form
@@ -86,9 +117,20 @@ export function ConductorView() {
               <option>Route 7</option>
             </select>
           </div>
+          <label className="flex items-start gap-2 text-xs text-slate-300">
+            <input
+              type="checkbox"
+              checked={preTripConfirmed}
+              onChange={(e) => setPreTripConfirmed(e.target.checked)}
+              className="mt-0.5 accent-lime"
+              required
+            />
+            <span>I confirm this vehicle has passed pre-trip inspection: brakes, tires, lights, fuel.</span>
+          </label>
           <button
             type="submit"
-            className="w-full py-2.5 bg-lime text-ink font-bold rounded hover:bg-lime/90 transition text-sm"
+            disabled={!preTripConfirmed}
+            className="w-full py-2.5 bg-lime text-ink font-bold rounded hover:bg-lime/90 disabled:cursor-not-allowed disabled:opacity-50 transition text-sm"
           >
             Start Shift & Verify Bus Status
           </button>

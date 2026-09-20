@@ -1,21 +1,21 @@
-import { useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   manuallyAllocateBus,
   processCitySignal,
   type CityDisruptionType,
 } from "@/lib/transitBrain";
-import type { LogEntry, SignalId } from "@/lib/transit";
+import type { SignalId } from "@/lib/transit";
+import { supabase } from "@/lib/supabase";
 
 export interface OperatorViewProps {
   active: SignalId[];
   toggle: (id: SignalId) => void;
-  log: LogEntry[];
 }
-
-interface StandbyBus {
+interface FleetBus {
+  id: string;
   busNumber: string;
-  currentRoute: string;
-  status: "Standby" | "Repositioning";
+  routeId: string | null;
+  status: string;
 }
 interface DisruptionEvent {
   id: CityDisruptionType;
@@ -35,16 +35,20 @@ const routes = ["Route 218", "Route 113", "Route 7"];
 const inputClassName =
   "mt-1.5 w-full rounded-xl border border-white/10 bg-panel2 px-3.5 py-3 text-sm text-white outline-none transition focus:border-lime/50";
 
-export function OperatorView({ active, toggle, log }: OperatorViewProps) {
+function displayStatus(status: string): string {
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+export function OperatorView({ active, toggle }: OperatorViewProps) {
   const [officerCode, setOfficerCode] = useState("");
+  const [officerName, setOfficerName] = useState("");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [standbyBuses, setStandbyBuses] = useState<StandbyBus[]>([
-    { busNumber: "TS09Z7001", currentRoute: "Depot South", status: "Standby" },
-    { busNumber: "TS09Z7002", currentRoute: "Depot South", status: "Standby" },
-    { busNumber: "TS09Z7003", currentRoute: "Depot South", status: "Standby" },
-  ]);
+  const [fleetBuses, setFleetBuses] = useState<FleetBus[]>([]);
+  const [feedbackCount, setFeedbackCount] = useState(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isOffline, setIsOffline] = useState(false);
   const [allocationRoute, setAllocationRoute] = useState(routes[0]!);
-  const [selectedBus, setSelectedBus] = useState(standbyBuses[0]!.busNumber);
+  const [selectedBus, setSelectedBus] = useState("");
   const [eventState, setEventState] = useState<Record<CityDisruptionType, boolean>>({
     bandh: false,
     waterlogging: false,
@@ -54,14 +58,81 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
   });
   const [notice, setNotice] = useState("");
 
-  function authenticate(event: FormEvent<HTMLFormElement>) {
+  const standbyBuses = fleetBuses.filter((bus) => bus.status === "standby");
+  const breakdownBuses = fleetBuses.filter((bus) => bus.status === "breakdown");
+
+  const fetchDepotData = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const [busResponse, feedbackResponse] = await Promise.all([
+        supabase.from("buses").select("id, bus_number, route_id, status"),
+        supabase.from("feedback").select("id", { count: "exact", head: true }),
+      ]);
+      if (busResponse.error) throw busResponse.error;
+      if (feedbackResponse.error) throw feedbackResponse.error;
+      const liveFleet = (busResponse.data ?? []).map((bus) => ({
+          id: bus.id as string,
+          busNumber: bus.bus_number as string,
+          routeId: (bus.route_id as string | null) ?? null,
+          status: bus.status as string,
+        }));
+      setFleetBuses(liveFleet);
+      setSelectedBus((current) =>
+        current && liveFleet.some((bus) => bus.busNumber === current)
+          ? current
+          : liveFleet.find((bus) => bus.status === "standby")?.busNumber ?? "",
+      );
+      setFeedbackCount(feedbackResponse.count ?? 0);
+      setIsOffline(false);
+    } catch (error) {
+      console.warn("Depot live data unavailable:", error);
+      setFleetBuses([]);
+      setFeedbackCount(0);
+      setIsOffline(true);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    void fetchDepotData();
+    const channel = supabase
+      .channel("public:operator-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "buses" }, () => void fetchDepotData())
+      .on("postgres_changes", { event: "*", schema: "public", table: "feedback" }, () => void fetchDepotData())
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          setFleetBuses([]);
+          setFeedbackCount(0);
+          setIsOffline(true);
+        }
+      });
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [fetchDepotData, isAuthenticated]);
+
+  async function authenticate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (officerCode.trim().length < 4) {
-      setNotice("Enter a valid RTC officer badge ID or officer code.");
+    const badgeCode = officerCode.trim();
+    if (!badgeCode) {
+      setNotice("Enter an RTC officer badge ID or officer code.");
       return;
     }
+    const { data: officer, error } = await supabase
+      .from("officers")
+      .select("badge_code, display_name")
+      .eq("badge_code", badgeCode)
+      .maybeSingle();
+    if (error || !officer) {
+      setIsAuthenticated(false);
+      setNotice("Officer verification failed. Check the badge code and try again.");
+      return;
+    }
+    setOfficerName(officer.display_name ?? badgeCode);
     setIsAuthenticated(true);
-    setNotice(`Officer #${officerCode.trim()} authenticated for Depot South.`);
+    setNotice(`Officer #${badgeCode} authenticated for Depot South.`);
   }
 
   async function toggleDisruption(event: DisruptionEvent) {
@@ -80,13 +151,7 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
   async function allocateBus() {
     const result = await manuallyAllocateBus(selectedBus, allocationRoute);
     setNotice(result.message);
-    setStandbyBuses((current) =>
-      current.map((bus) =>
-        bus.busNumber === selectedBus
-          ? { ...bus, currentRoute: allocationRoute, status: "Repositioning" }
-          : bus,
-      ),
-    );
+    if (result.success) void fetchDepotData();
   }
 
   if (!isAuthenticated) {
@@ -137,6 +202,11 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
 
   return (
     <div className="space-y-6">
+      {isOffline && (
+        <div role="alert" className="rounded-2xl border border-amber/30 bg-amber/10 px-4 py-3 text-xs font-semibold text-amber">
+          Live depot data unavailable. Fleet, breakdown, and feedback data are hidden.
+        </div>
+      )}
       <section className="bg-panel rounded-3xl p-5 border border-white/10">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -144,7 +214,7 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
               RTC Depot Administrative Controls
             </span>
             <h2 className="font-display font-bold text-xl tracking-tight mt-3">
-              Officer #{officerCode} · Zone Depot South
+              Officer #{officerCode} · {officerName} · Zone Depot South
             </h2>
           </div>
           <button
@@ -175,20 +245,24 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-panel2 rounded-2xl border border-white/10 p-4 space-y-3">
-            <p className="text-xs font-bold text-lime uppercase tracking-wider">Standby Fleet</p>
-            {standbyBuses.map((bus) => (
+            <p className="text-xs font-bold text-lime uppercase tracking-wider">Live Fleet</p>
+            {isLoading && <p className="text-xs text-white/50">Loading live fleet...</p>}
+            {!isLoading && !isOffline && fleetBuses.length === 0 && (
+              <p className="text-xs text-white/50">No fleet data available.</p>
+            )}
+            {!isOffline && fleetBuses.map((bus) => (
               <div
                 key={bus.busNumber}
                 className="flex items-center justify-between gap-3 border-b border-white/10 pb-2 last:border-0 last:pb-0"
               >
                 <div>
                   <p className="text-sm font-bold text-white">{bus.busNumber}</p>
-                  <p className="text-[11px] text-white/50">{bus.currentRoute}</p>
+                  <p className="text-[11px] text-white/50">{bus.routeId ?? "Unassigned route"}</p>
                 </div>
                 <span
-                  className={`text-[10px] font-bold ${bus.status === "Standby" ? "text-lime" : "text-amber"}`}
+                  className={`text-[10px] font-bold ${bus.status === "standby" ? "text-lime" : "text-amber"}`}
                 >
-                  {bus.status}
+                  {displayStatus(bus.status)}
                 </span>
               </div>
             ))}
@@ -205,7 +279,7 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
                 onChange={(event) => setSelectedBus(event.target.value)}
               >
                 {standbyBuses
-                  .filter((bus) => bus.status === "Standby" || bus.busNumber === selectedBus)
+                  .filter((bus) => bus.status === "standby" || bus.busNumber === selectedBus)
                   .map((bus) => (
                     <option key={bus.busNumber}>{bus.busNumber}</option>
                   ))}
@@ -237,14 +311,20 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
             <p className="text-[10px] uppercase tracking-wider text-red-300 font-bold">
               Active Breakdowns
             </p>
-            <p className="text-sm text-white mt-1">1 incident · TS09Z1234</p>
-            <p className="text-[11px] text-white/50 mt-1">Backup dispatch monitoring active</p>
+            <p className="text-sm text-white mt-1">{breakdownBuses.length} active incident(s)</p>
+            <div className="mt-1 space-y-1">
+              {breakdownBuses.map((bus) => (
+                <p key={bus.id} className="text-[11px] text-white/60">
+                  {bus.busNumber} · {bus.routeId ?? "Unassigned route"}
+                </p>
+              ))}
+            </div>
           </div>
           <div className="rounded-2xl border border-amber/20 bg-amber/10 p-3">
             <p className="text-[10px] uppercase tracking-wider text-amber font-bold">
               Driver / Conductor Feedback
             </p>
-            <p className="text-sm text-white mt-1">3 reports awaiting audit</p>
+            <p className="text-sm text-white mt-1">{feedbackCount} reports awaiting audit</p>
             <p className="text-[11px] text-white/50 mt-1">Conduct and delay reports queued</p>
           </div>
         </div>
@@ -271,24 +351,6 @@ export function OperatorView({ active, toggle, log }: OperatorViewProps) {
                 className={`ml-auto size-2 rounded-full ${eventState[event.id] ? "bg-ink" : "bg-white/30"}`}
               />
             </button>
-          ))}
-        </div>
-      </section>
-      <section className="bg-panel rounded-3xl border border-white/10 p-5">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="font-display font-bold text-lg">AI Agent Activity</h2>
-          <span className="text-[10px] uppercase tracking-widest text-lime bg-lime/10 border border-lime/20 rounded-full px-2.5 py-1">
-            {active.length + 3} agents
-          </span>
-        </div>
-        <div className="space-y-3 max-h-64 overflow-y-auto">
-          {log.map((entry) => (
-            <div key={entry.id} className="bg-panel2/60 rounded-2xl p-3 border border-white/10">
-              <p className="text-sm font-semibold">{entry.agent}</p>
-              <p className="text-xs text-white/50">
-                {entry.message} · {entry.time}
-              </p>
-            </div>
           ))}
         </div>
       </section>
