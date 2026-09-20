@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   manuallyAllocateBus,
+  markBusRepaired,
   processCitySignal,
   type CityDisruptionType,
 } from "@/lib/transitBrain";
@@ -49,6 +50,7 @@ export function OperatorView({ active, toggle }: OperatorViewProps) {
   const [isOffline, setIsOffline] = useState(false);
   const [allocationRoute, setAllocationRoute] = useState(routes[0]!);
   const [selectedBus, setSelectedBus] = useState("");
+  const [repairingBus, setRepairingBus] = useState<string | null>(null);
   const [eventState, setEventState] = useState<Record<CityDisruptionType, boolean>>({
     bandh: false,
     waterlogging: false,
@@ -149,6 +151,14 @@ export function OperatorView({ active, toggle }: OperatorViewProps) {
   async function allocateBus() {
     const result = await manuallyAllocateBus(selectedBus, allocationRoute);
     setNotice(result.message);
+    if (result.success) void fetchDepotData();
+  }
+
+  async function repairBus(busNumber: string) {
+    setRepairingBus(busNumber);
+    const result = await markBusRepaired(busNumber);
+    setNotice(result.message);
+    setRepairingBus(null);
     if (result.success) void fetchDepotData();
   }
 
@@ -312,9 +322,22 @@ export function OperatorView({ active, toggle }: OperatorViewProps) {
             <p className="text-sm text-white mt-1">{breakdownBuses.length} active incident(s)</p>
             <div className="mt-1 space-y-1">
               {breakdownBuses.map((bus) => (
-                <p key={bus.id} className="text-[11px] text-white/60">
-                  {bus.busNumber} · {bus.routeId ?? "Unassigned route"}
-                </p>
+                <div
+                  key={bus.id}
+                  className="flex items-center justify-between gap-2 border-b border-white/10 py-1 last:border-0"
+                >
+                  <p className="text-[11px] text-white/60">
+                    {bus.busNumber} · {bus.routeId ?? "Unassigned route"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void repairBus(bus.busNumber)}
+                    disabled={repairingBus === bus.busNumber}
+                    className="shrink-0 rounded-lg border border-lime/30 px-2 py-1 text-[10px] font-bold text-lime transition hover:bg-lime/10 disabled:cursor-wait disabled:opacity-50"
+                  >
+                    {repairingBus === bus.busNumber ? "Updating..." : "Mark as Repaired"}
+                  </button>
+                </div>
               ))}
             </div>
           </div>

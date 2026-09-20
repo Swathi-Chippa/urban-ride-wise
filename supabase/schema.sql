@@ -480,6 +480,33 @@ $$;
 revoke all on function public.report_bus_breakdown(text) from public;
 grant execute on function public.report_bus_breakdown(text) to anon;
 
+create or replace function public.mark_bus_repaired(
+  target_bus_number text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  repaired_bus_id uuid;
+begin
+  update public.buses
+     set status = 'standby',
+         is_verified = false,
+         conductor_id = null,
+         updated_at = now()
+   where bus_number = target_bus_number
+     and status = 'breakdown'
+  returning id into repaired_bus_id;
+
+  return repaired_bus_id;
+end;
+$$;
+
+revoke all on function public.mark_bus_repaired(text) from public;
+grant execute on function public.mark_bus_repaired(text) to anon;
+
 create or replace function public.update_bus_occupancy(
   target_bus_number text,
   target_occupancy text

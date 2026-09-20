@@ -175,6 +175,25 @@ export async function reportConductorEvent(
   }
 }
 
+export async function markBusRepaired(busNumber: string): Promise<FleetActionResult> {
+  try {
+    const { data: repairedBusId, error } = await supabase.rpc("mark_bus_repaired", {
+      target_bus_number: busNumber,
+    });
+    if (error) throw error;
+    if (typeof repairedBusId !== "string") {
+      return {
+        success: false,
+        message: `${busNumber} is not currently marked as breakdown.`,
+      };
+    }
+    return { success: true, message: `${busNumber} marked as repaired and returned to standby.` };
+  } catch (error) {
+    console.error("Error marking bus repaired:", error);
+    return { success: false, message: "Unable to mark the bus as repaired in Supabase." };
+  }
+}
+
 export async function updateBusOccupancy(
   busNumber: string,
   occupancy: "Low" | "Moderate" | "Overcrowded" | "Overcrowded (Surge)",
