@@ -256,9 +256,14 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
       userType: profileForm.userType,
       routeId: profileForm.routeId,
       timeSlot: profileForm.timeSlot,
+      phone: profileForm.passIdOrPhone,
     });
-    setDemand(result.metrics);
-    setDemandTriggerStatus(result.triggerStatus);
+    if (result) {
+      setDemand(result.metrics);
+      setDemandTriggerStatus(result.triggerStatus);
+    } else {
+      setDemandTriggerStatus("Live demand registration unavailable. Please try again.");
+    }
     setIsRegistering(false);
     setIsRegistrationOpen(false);
   }

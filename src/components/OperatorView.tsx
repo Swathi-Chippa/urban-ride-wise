@@ -120,17 +120,15 @@ export function OperatorView({ active, toggle }: OperatorViewProps) {
       setNotice("Enter an RTC officer badge ID or officer code.");
       return;
     }
-    const { data: officer, error } = await supabase
-      .from("officers")
-      .select("badge_code, display_name")
-      .eq("badge_code", badgeCode)
-      .maybeSingle();
-    if (error || !officer) {
+    const { data: officerNameResult, error } = await supabase.rpc("officer_login", {
+      badge_code: badgeCode,
+    });
+    if (error || typeof officerNameResult !== "string" || !officerNameResult) {
       setIsAuthenticated(false);
       setNotice("Officer verification failed. Check the badge code and try again.");
       return;
     }
-    setOfficerName(officer.display_name ?? badgeCode);
+    setOfficerName(officerNameResult);
     setIsAuthenticated(true);
     setNotice(`Officer #${badgeCode} authenticated for Depot South.`);
   }
