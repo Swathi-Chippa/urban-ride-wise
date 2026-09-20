@@ -51,19 +51,10 @@ const signalNames: Partial<Record<CityDisruptionType, string>> = {
 };
 
 async function repositionStandbyBus(routeId: string): Promise<boolean> {
-  const { data: standbyBuses, error: selectError } = await supabase
-    .from("buses")
-    .select("id")
-    .eq("status", "Standby")
-    .limit(1);
-  const standbyId = standbyBuses?.[0]?.id;
-  if (selectError || !standbyId) return false;
-
-  const { error: updateError } = await supabase
-    .from("buses")
-    .update({ status: "Repositioning", route_id: routeId, updated_at: new Date().toISOString() })
-    .eq("id", standbyId);
-  return !updateError;
+  const { data: dispatchedBusId, error } = await supabase.rpc("dispatch_standby", {
+    target_route: routeId,
+  });
+  return !error && typeof dispatchedBusId === "string";
 }
 
 export async function processCitySignal(
@@ -89,11 +80,22 @@ export async function processCitySignal(
     const predictedDemand = isActive
       ? Math.round(route.baseline_demand * signal.multiplier)
       : route.baseline_demand;
-    await supabase
+    const { data: updatedSignal, error: signalUpdateError } = await supabase
       .from("city_signals")
       .update({ is_active: isActive })
-      .eq("signal_name", databaseSignalName);
-    await supabase.from("routes").update({ predicted_demand: predictedDemand }).eq("id", route.id);
+      .eq("signal_name", databaseSignalName)
+      .select("id")
+      .maybeSingle();
+    if (signalUpdateError || !updatedSignal) return null;
+
+    const { data: updatedRoute, error: routeUpdateError } = await supabase
+      .from("routes")
+      .update({ predicted_demand: predictedDemand })
+      .eq("id", route.id)
+      .select("id")
+      .maybeSingle();
+    if (routeUpdateError || !updatedRoute) return null;
+
     const standbyUnitsDispatched =
       predictedDemand > DEMAND_THRESHOLD ? await repositionStandbyBus(signal.zone) : false;
 
@@ -166,37 +168,60 @@ export async function reportConductorEvent(
   busNumber: string,
   eventType: "TRIP_START" | "BREAKDOWN" | "END_SHIFT",
   conductorId?: string,
+  routeId?: string,
 ): Promise<FleetActionResult> {
   try {
     if (eventType === "TRIP_START") {
-      const { error } = await supabase
-        .from("buses")
-        .update({
-          status: "Active",
-          is_verified: true,
-          conductor_id: conductorId ?? "COND-UNKNOWN",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("bus_number", busNumber);
+      const { data, error } = await supabase.rpc("start_conductor_shift", {
+        target_bus_number: busNumber,
+        target_conductor_id: conductorId ?? "COND-UNKNOWN",
+        target_route: routeId ?? "",
+      });
       if (error) throw error;
+      if (typeof data !== "string") {
+        return {
+          success: false,
+          message: `${busNumber} is not available for shift start (must be standby or repositioning).`,
+        };
+      }
       return { success: true, message: `Bus ${busNumber} is Active and CONDUCTOR VERIFIED LIVE.` };
     }
 
     if (eventType === "END_SHIFT") {
-      const { error } = await supabase
-        .from("buses")
-        .update({ status: "Unverified", is_verified: false, updated_at: new Date().toISOString() })
-        .eq("bus_number", busNumber);
+      const { data, error } = await supabase.rpc("end_conductor_shift", {
+        target_bus_number: busNumber,
+      });
       if (error) throw error;
+      if (typeof data !== "string") {
+        return {
+          success: false,
+          message: `Unable to end shift for ${busNumber}; no matching active bus was found.`,
+        };
+      }
       return { success: true, message: `Shift ended for ${busNumber}; bus is Unverified.` };
     }
 
-    const { error: breakdownError } = await supabase
+    const { data: brokenBus, error: routeLookupError } = await supabase
       .from("buses")
-      .update({ status: "Breakdown", is_verified: false, updated_at: new Date().toISOString() })
-      .eq("bus_number", busNumber);
+      .select("route_id")
+      .eq("bus_number", busNumber)
+      .single();
+    if (routeLookupError || !brokenBus?.route_id) {
+      throw routeLookupError ?? new Error(`No route found for bus ${busNumber}.`);
+    }
+
+    const { data: updatedBreakdown, error: breakdownError } = await supabase.rpc(
+      "report_bus_breakdown",
+      { target_bus_number: busNumber },
+    );
     if (breakdownError) throw breakdownError;
-    const standbyRepositioned = await repositionStandbyBus("Route 218");
+    if (typeof updatedBreakdown !== "string") {
+      return {
+        success: false,
+        message: `Breakdown already reported or bus ${busNumber} is not in service.`,
+      };
+    }
+    const standbyRepositioned = await repositionStandbyBus(brokenBus.route_id);
     return {
       success: true,
       message: standbyRepositioned
@@ -214,11 +239,17 @@ export async function updateBusOccupancy(
   occupancy: "Low" | "Moderate" | "Overcrowded" | "Overcrowded (Surge)",
 ): Promise<FleetActionResult> {
   try {
-    const { error } = await supabase
-      .from("buses")
-      .update({ occupancy, updated_at: new Date().toISOString() })
-      .eq("bus_number", busNumber);
+    const { data, error } = await supabase.rpc("update_bus_occupancy", {
+      target_bus_number: busNumber,
+      target_occupancy: occupancy,
+    });
     if (error) throw error;
+    if (typeof data !== "string") {
+      return {
+        success: false,
+        message: `Unable to update occupancy; bus ${busNumber} was not found.`,
+      };
+    }
     return { success: true, message: `Live occupancy updated to ${occupancy}.` };
   } catch (error) {
     console.error("Error updating occupancy:", error);
@@ -231,15 +262,17 @@ export async function manuallyAllocateBus(
   targetRoute: string,
 ): Promise<FleetActionResult> {
   try {
-    const { error } = await supabase
-      .from("buses")
-      .update({
-        status: "Repositioning",
-        route_id: targetRoute,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("bus_number", busNumber);
+    const { data: allocatedBusId, error } = await supabase.rpc("allocate_bus_by_number", {
+      target_bus_number: busNumber,
+      target_route: targetRoute,
+    });
     if (error) throw error;
+    if (typeof allocatedBusId !== "string") {
+      return {
+        success: false,
+        message: `${busNumber} is no longer standby or is unavailable for allocation.`,
+      };
+    }
     return { success: true, message: `${busNumber} allocated to ${targetRoute}.` };
   } catch (error) {
     console.error("Error allocating bus:", error);

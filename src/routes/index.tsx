@@ -3,12 +3,7 @@ import { useState } from "react";
 import { OperatorView } from "@/components/OperatorView";
 import { PassengerView } from "@/components/PassengerView";
 import { ConductorView } from "@/components/ConductorView";
-import {
-  BASE_LOG,
-  SIGNAL_LOG,
-  type LogEntry,
-  type SignalId,
-} from "@/lib/transit";
+import type { SignalId } from "@/lib/transit";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -39,30 +34,10 @@ function timeNow() {
 function Index() {
   const [view, setView] = useState<"student" | "conductor" | "depot">("student");
   const [active, setActive] = useState<SignalId[]>([]);
-  const [log, setLog] = useState<LogEntry[]>(BASE_LOG);
 
   const toggle = (id: SignalId) => {
     const on = active.includes(id);
     setActive(on ? active.filter((s) => s !== id) : [...active, id]);
-
-    const time = timeNow();
-    const entries: LogEntry[] = on
-      ? [
-          {
-            id: `${id}-off-${Date.now()}`,
-            agent: "Routing agent",
-            message: "Signal cleared — corridor returning to baseline plan",
-            dot: "violet",
-            time,
-          },
-        ]
-      : SIGNAL_LOG[id].map((e, i) => ({
-          ...e,
-          id: `${id}-${Date.now()}-${i}`,
-          time,
-        }));
-
-    setLog((prev) => [...entries, ...prev].slice(0, 14));
   };
 
   return (
@@ -128,7 +103,7 @@ function Index() {
         {view === "student" && <PassengerView active={active} />}
         {view === "conductor" && <ConductorView />}
         {view === "depot" && (
-          <OperatorView active={active} toggle={toggle} log={log} />
+          <OperatorView active={active} toggle={toggle} />
         )}
       </main>
     </div>

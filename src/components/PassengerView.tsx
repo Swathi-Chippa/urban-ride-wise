@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+﻿import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { registerCommuteIntent, type CommuteIntentResult } from "@/lib/transitBrain";
 import { supabase } from "@/lib/supabase";
 
@@ -24,6 +24,8 @@ export interface FeedbackReport {
 export interface LiveBus {
   id: string;
   name: string;
+  routeId?: string;
+  status?: string;
   origin: string;
   destination: string;
   scheduled: string;
@@ -37,6 +39,74 @@ export interface LiveBus {
   isVerified?: boolean;
   is_verified: boolean;
   occupancy: string;
+}
+interface RouteMetadata {
+  id: string;
+  name: string;
+  base_eta_minutes: number;
+  base_crowding: number;
+}
+
+interface BusRow {
+  id: string;
+  bus_number: string;
+  route_id: string | null;
+  status: string;
+  is_verified: boolean;
+  occupancy: string | null;
+}
+
+function getCrowdPresentation(baseCrowding: number) {
+  if (baseCrowding >= 75) return { label: `Estimated high crowding (${baseCrowding}%)`, badge: "high" as const };
+  if (baseCrowding >= 50) return { label: `Estimated moderate crowding (${baseCrowding}%)`, badge: "medium" as const };
+  return { label: `Estimated low crowding (${baseCrowding}%)`, badge: "low" as const };
+}
+
+interface BusStatusPresentation {
+  label: string;
+  canBoard: boolean;
+  className: string;
+}
+
+function getBusStatusPresentation(status?: string): BusStatusPresentation {
+  switch (status?.toLowerCase()) {
+    case "active":
+      return {
+        label: "ACTIVE SERVICE",
+        canBoard: true,
+        className: "bg-lime/20 text-lime border-lime/30",
+      };
+    case "breakdown":
+      return {
+        label: "OUT OF SERVICE",
+        canBoard: false,
+        className: "bg-red-500/20 text-red-300 border-red-500/30",
+      };
+    case "unverified":
+      return {
+        label: "UNVERIFIED · BOARDING CLOSED",
+        canBoard: false,
+        className: "bg-white/10 text-white/60 border-white/10",
+      };
+    case "standby":
+      return {
+        label: "STANDBY · NOT DISPATCHED",
+        canBoard: false,
+        className: "bg-white/10 text-white/60 border-white/10",
+      };
+    case "repositioning":
+      return {
+        label: "REPOSITIONING · NOT BOARDING",
+        canBoard: false,
+        className: "bg-amber/20 text-amber border-amber/30",
+      };
+    default:
+      return {
+        label: "STATUS UNKNOWN · BOARDING CLOSED",
+        canBoard: false,
+        className: "bg-white/10 text-white/60 border-white/10",
+      };
+  }
 }
 
 const userCategories = ["Student", "Working Professional", "Daily Commuter"];
@@ -64,16 +134,16 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
     timeSlot: timeSlotChoices[0]!,
   });
   const [demand, setDemand] = useState<CommuteIntentResult["metrics"]>({
-    totalDemand: 184,
-    activeBusesCount: 2,
+    totalDemand: 0,
+    activeBusesCount: 0,
     routeId: "Route 218",
     timeSlot: "Morning Peak",
-    activeRegistrations: 184,
+    activeRegistrations: 0,
     threshold: 150,
-    highDemand: true,
+    highDemand: false,
   });
   const [demandTriggerStatus, setDemandTriggerStatus] = useState(
-    "High demand detected; RTC Depot notified for extra bus allocation.",
+    "Awaiting live demand data.",
   );
   const [isRegistering, setIsRegistering] = useState(false);
   const [feedback, setFeedback] = useState<FeedbackReport | null>(null);
@@ -85,77 +155,71 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
     comments: "",
   });
 
-  const [routes, setRoutes] = useState<LiveBus[]>([
-    {
-      id: "218",
-      name: "Route 218 · Express",
-      origin: "Ameerpet X Roads",
-      destination: "CBIT / Gandipet Campus",
-      scheduled: "08:20 AM",
-      actual: "08:32 AM",
-      delay: "+12 MIN DELAY",
-      isVerified: true,
-      is_verified: true,
-      occupancy: "High",
-      busNo: "TS09Z1234",
-      eta: "8 min",
-      crowdLevel: "High Crowding Predicted (88%)",
-      crowdBadge: "high",
-      recommended: true,
-    },
-    {
-      id: "113",
-      name: "Route 113 · Local",
-      origin: "Koti Bus Stop",
-      destination: "CBIT College via Mehdipatnam",
-      scheduled: "08:25 AM",
-      actual: "08:26 AM",
-      delay: "ON TIME",
-      isVerified: false,
-      is_verified: false,
-      occupancy: "Moderate",
-      busNo: "TS09Z5678",
-      eta: "14 min",
-      crowdLevel: "Moderate Crowding (45%)",
-      crowdBadge: "medium",
-      recommended: false,
-    },
-  ]);
+  const [buses, setBuses] = useState<LiveBus[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isOffline, setIsOffline] = useState(false);
 
   const fetchBusesAndDemand = useCallback(async () => {
+    setIsLoading(true);
+    setBuses([]);
     try {
-      const { data: buses } = await supabase.from("buses").select("*");
-      if (buses?.length) {
-        setRoutes((current) =>
-          current.map((bus) => {
-            const liveBus = buses.find((row) => row.bus_number === bus.busNo) as
-              { is_verified?: boolean; occupancy?: string } | undefined;
-            return liveBus
-              ? {
-                  ...bus,
-                  isVerified: liveBus.is_verified === true,
-                  is_verified: liveBus.is_verified === true,
-                  occupancy: liveBus.occupancy ?? bus.occupancy,
-                }
-              : bus;
-          }),
-        );
-      }
+      const [busResponse, routeResponse, demandResponse] = await Promise.all([
+        supabase
+          .from("buses")
+          .select("id, bus_number, route_id, status, is_verified, occupancy"),
+        supabase.from("routes").select("id, name, base_eta_minutes, base_crowding"),
+        supabase
+          .from("commuter_intent")
+          .select("id", { count: "exact", head: true })
+          .eq("route_id", demand.routeId),
+      ]);
 
-      const { count } = await supabase
-        .from("commuter_intent")
-        .select("id", { count: "exact", head: true })
-        .eq("route_id", demand.routeId);
-      if (typeof count === "number") {
-        setDemand((current) => ({
-          ...current,
-          totalDemand: count,
-          activeRegistrations: count,
-          highDemand: count > current.threshold,
-        }));
-      }
+      if (busResponse.error) throw busResponse.error;
+      if (routeResponse.error) throw routeResponse.error;
+      if (demandResponse.error) throw demandResponse.error;
+
+      const routeMetadata = new Map(
+        ((routeResponse.data ?? []) as RouteMetadata[]).map((route) => [route.id, route]),
+      );
+      const liveBuses = ((busResponse.data ?? []) as BusRow[]).map((bus) => {
+        const route = bus.route_id ? routeMetadata.get(bus.route_id) : undefined;
+        const baseEta = route?.base_eta_minutes ?? 0;
+        const crowd = getCrowdPresentation(Number(route?.base_crowding ?? 0));
+        return {
+          id: bus.id,
+          name: route?.name ?? bus.route_id ?? "Unassigned route",
+          routeId: bus.route_id ?? "Unassigned",
+          origin: "Live route data",
+          destination: bus.route_id ?? "Unassigned route",
+          scheduled: "Not provided",
+          actual: baseEta > 0 ? `Estimated ${baseEta} min` : "Estimated ETA unavailable",
+          busNo: bus.bus_number,
+          eta: baseEta > 0 ? `Estimated ${baseEta} min` : "Estimated ETA unavailable",
+          delay: "No live delay feed",
+          status: bus.status,
+          isVerified: bus.is_verified === true,
+          is_verified: bus.is_verified === true,
+          occupancy: bus.occupancy ?? "Unknown",
+          crowdLevel: crowd.label,
+          crowdBadge: crowd.badge,
+          recommended: false,
+        } satisfies LiveBus;
+      });
+      setBuses(liveBuses);
+      setDemand((current) => ({
+        ...current,
+        totalDemand: demandResponse.count ?? 0,
+        activeRegistrations: demandResponse.count ?? 0,
+        activeBusesCount: liveBuses.length,
+        highDemand: (demandResponse.count ?? 0) > current.threshold,
+      }));
+      setIsOffline(false);
     } catch (error) {
-      console.warn("Live bus fetch unavailable; retaining current view:", error);
+      console.warn("Live passenger data unavailable:", error);
+      setBuses([]);
+      setIsOffline(true);
+    } finally {
+      setIsLoading(false);
     }
   }, [demand.routeId]);
 
@@ -168,7 +232,12 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
         { event: "*", schema: "public", table: "buses" },
         () => void fetchBusesAndDemand(),
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          setBuses([]);
+          setIsOffline(true);
+        }
+      });
 
     return () => {
       void supabase.removeChannel(channel);
@@ -208,6 +277,15 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
+      {isOffline && (
+        <div
+          role="alert"
+          className="rounded-2xl border border-amber/30 bg-amber/10 px-4 py-3 text-sm font-semibold text-amber"
+        >
+          Live data unavailable. Verification and occupancy information are hidden until the
+          connection is restored.
+        </div>
+      )}
       <div className="bg-panel rounded-3xl p-6 border border-white/10 space-y-4">
         <div className="flex items-center justify-between">
           <div>
@@ -308,7 +386,13 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
         <h3 className="font-display font-bold text-lg tracking-tight text-white/90">
           Available Campus Corridor Buses
         </h3>
-        {routes.map((bus) => (
+        {isLoading && <p className="text-sm text-white/60">Loading live bus data...</p>}
+        {!isLoading && !isOffline && buses.length === 0 && (
+          <p className="rounded-2xl border border-white/10 bg-panel p-4 text-sm text-white/60">
+            No buses are currently available in the live fleet feed.
+          </p>
+        )}
+        {!isOffline && buses.map((bus) => (
           <div
             key={bus.id}
             className={`p-6 rounded-3xl border transition-all ${bus.recommended ? "bg-panel border-lime/40 shadow-lg shadow-lime/5" : "bg-panel/70 border-white/10"}`}
@@ -323,7 +407,12 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
                 <span
                   className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${bus.is_verified ? "bg-lime/20 text-lime border-lime/30" : "bg-white/10 text-white/60 border-white/10"}`}
                 >
-                  {bus.isVerified ? "● CONDUCTOR VERIFIED LIVE" : "○ UNVERIFIED SCHEDULE"}
+                  {bus.is_verified ? "● CONDUCTOR VERIFIED LIVE" : "○ UNVERIFIED"}
+                </span>
+                <span
+                  className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${getBusStatusPresentation(bus.status).className}`}
+                >
+                  {getBusStatusPresentation(bus.status).label}
                 </span>
               </div>
               <span className="text-xs font-mono font-semibold text-white/50">{bus.busNo}</span>
@@ -371,9 +460,14 @@ export function PassengerView({ active = [] }: PassengerViewProps) {
               </div>
               <button
                 type="button"
-                className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-lime text-ink font-display font-bold text-xs hover:bg-lime/90 transition-all"
+                disabled={!getBusStatusPresentation(bus.status).canBoard}
+                className={`w-full sm:w-auto px-5 py-2.5 rounded-xl font-display font-bold text-xs transition-all ${
+                  getBusStatusPresentation(bus.status).canBoard
+                    ? "bg-lime text-ink hover:bg-lime/90"
+                    : "cursor-not-allowed bg-white/10 text-white/40"
+                }`}
               >
-                Board This Bus
+                {getBusStatusPresentation(bus.status).canBoard ? "Board This Bus" : "Boarding Unavailable"}
               </button>
             </div>
           </div>
