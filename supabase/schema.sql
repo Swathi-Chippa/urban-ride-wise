@@ -75,7 +75,7 @@ create table if not exists public.feedback (
   created_at timestamptz not null default now()
 );
 
--- Demo-only officer lookup for the client-side verification gate.
+-- Demo-only officer lookup via a SECURITY DEFINER RPC; the officers table is not publicly readable.
 -- Production authentication should use Supabase Auth and server-side verification.
 create table if not exists public.officers (
   id uuid primary key default gen_random_uuid(),
@@ -160,8 +160,28 @@ create policy feedback_anon_select on public.feedback
   for select to anon using (true);
 
 drop policy if exists officers_anon_select on public.officers;
-create policy officers_anon_select on public.officers
-  for select to anon using (true);
+revoke select on table public.officers from anon;
+
+create or replace function public.officer_login(badge_code text)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  officer_name text;
+begin
+  select o.display_name
+    into officer_name
+    from public.officers as o
+   where o.badge_code = $1;
+
+  return officer_name;
+end;
+$$;
+
+revoke all on function public.officer_login(text) from public;
+grant execute on function public.officer_login(text) to anon;
 
 alter table public.buses replica identity full;
 
@@ -213,7 +233,129 @@ end;
 $$;
 
 revoke all on function public.dispatch_standby(text) from public;
-grant execute on function public.dispatch_standby(text) to anon;
+revoke execute on function public.dispatch_standby(text) from anon;
+
+create or replace function public.apply_city_signal(
+  signal_name text,
+  is_active boolean
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  signal_row record;
+  predicted integer;
+  dispatched boolean := false;
+begin
+  select cs.zone, cs.multiplier
+    into signal_row
+    from public.city_signals as cs
+   where cs.signal_name = apply_city_signal.signal_name;
+
+  if not found then
+    return null;
+  end if;
+
+  predicted := case
+    when is_active then round((
+      select r.baseline_demand * signal_row.multiplier
+        from public.routes as r
+       where r.name = signal_row.zone
+    ))::integer
+    else coalesce((
+      select r.baseline_demand
+        from public.routes as r
+       where r.name = signal_row.zone
+    ), 0)
+  end;
+
+  update public.city_signals
+     set is_active = apply_city_signal.is_active,
+         occurred_at = now()
+   where city_signals.signal_name = apply_city_signal.signal_name;
+
+  update public.routes
+     set predicted_demand = predicted
+   where routes.name = signal_row.zone;
+
+  if is_active and predicted > 150 then
+    dispatched := public.dispatch_standby(signal_row.zone) is not null;
+  end if;
+
+  return jsonb_build_object(
+    'zone', signal_row.zone,
+    'predicted_demand', predicted,
+    'standby_bus_dispatched', dispatched
+  );
+end;
+$$;
+
+revoke all on function public.apply_city_signal(text, boolean) from public;
+grant execute on function public.apply_city_signal(text, boolean) to anon;
+
+drop function if exists public.register_commute_intent(text, text, text);
+
+create or replace function public.register_commute_intent(
+  user_type text,
+  route_id text,
+  time_slot text,
+  phone text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  previous_count integer;
+  registration_count integer;
+  threshold_crossed boolean;
+  dispatched boolean := false;
+begin
+  -- Serialize registrations for this route/time slot so only the crossing
+  -- transaction can dispatch a standby bus.
+  perform pg_advisory_xact_lock(
+    hashtext(register_commute_intent.route_id),
+    hashtext(register_commute_intent.time_slot)
+  );
+
+  select count(*)::integer
+    into previous_count
+    from public.commuter_intent
+   where commuter_intent.route_id = register_commute_intent.route_id
+     and commuter_intent.time_slot = register_commute_intent.time_slot;
+
+  insert into public.commuter_intent (user_type, route_id, time_slot, phone)
+  values (
+    register_commute_intent.user_type,
+    register_commute_intent.route_id,
+    register_commute_intent.time_slot,
+    register_commute_intent.phone
+  );
+
+  select count(*)::integer
+    into registration_count
+    from public.commuter_intent
+   where commuter_intent.route_id = register_commute_intent.route_id
+     and commuter_intent.time_slot = register_commute_intent.time_slot;
+
+  threshold_crossed := previous_count < 150 and registration_count >= 150;
+  if threshold_crossed then
+    dispatched := public.dispatch_standby(register_commute_intent.route_id) is not null;
+  end if;
+
+  return jsonb_build_object(
+    'registration_count', registration_count,
+    'threshold_crossed', threshold_crossed,
+    'bus_dispatched', dispatched
+  );
+end;
+$$;
+
+revoke all on function public.register_commute_intent(text, text, text, text) from public;
+grant execute on function public.register_commute_intent(text, text, text, text) to anon;
 
 create or replace function public.allocate_bus_by_number(
   target_bus_number text,
@@ -317,6 +459,7 @@ set search_path = public
 as $$
 declare
   updated_bus_id uuid;
+  broken_route text;
 begin
   update public.buses
      set status = 'breakdown',
@@ -324,7 +467,11 @@ begin
          updated_at = now()
    where bus_number = target_bus_number
      and status in ('active', 'repositioning')
-  returning id into updated_bus_id;
+  returning id, route_id into updated_bus_id, broken_route;
+
+  if updated_bus_id is not null and broken_route is not null then
+    perform public.dispatch_standby(broken_route);
+  end if;
 
   return updated_bus_id;
 end;

@@ -40,7 +40,6 @@ export interface FleetActionResult {
 }
 
 const DEMAND_THRESHOLD = 150;
-const localDemand = new Map<string, number>([["Route 218|Morning Peak", 184]]);
 
 const signalNames: Partial<Record<CityDisruptionType, string>> = {
   bandh: "Bandh / Strike",
@@ -50,59 +49,27 @@ const signalNames: Partial<Record<CityDisruptionType, string>> = {
   exam_surge: "College Exam / Event Demand Surge",
 };
 
-async function repositionStandbyBus(routeId: string): Promise<boolean> {
-  const { data: dispatchedBusId, error } = await supabase.rpc("dispatch_standby", {
-    target_route: routeId,
-  });
-  return !error && typeof dispatchedBusId === "string";
-}
-
 export async function processCitySignal(
   signalName: CityDisruptionType,
   isActive: boolean,
 ): Promise<CitySignalResult | null> {
   try {
     const databaseSignalName = signalNames[signalName] ?? signalName;
-    const { data: signal, error: signalError } = await supabase
-      .from("city_signals")
-      .select("zone, multiplier")
-      .eq("signal_name", databaseSignalName)
-      .single();
-    if (signalError || !signal) return null;
+    const { data: signalResult, error } = await supabase.rpc("apply_city_signal", {
+      signal_name: databaseSignalName,
+      is_active: isActive,
+    });
+    if (error || !signalResult) return null;
 
-    const { data: route, error: routeError } = await supabase
-      .from("routes")
-      .select("id, baseline_demand")
-      .eq("name", signal.zone)
-      .single();
-    if (routeError || !route) return null;
-
-    const predictedDemand = isActive
-      ? Math.round(route.baseline_demand * signal.multiplier)
-      : route.baseline_demand;
-    const { data: updatedSignal, error: signalUpdateError } = await supabase
-      .from("city_signals")
-      .update({ is_active: isActive })
-      .eq("signal_name", databaseSignalName)
-      .select("id")
-      .maybeSingle();
-    if (signalUpdateError || !updatedSignal) return null;
-
-    const { data: updatedRoute, error: routeUpdateError } = await supabase
-      .from("routes")
-      .update({ predicted_demand: predictedDemand })
-      .eq("id", route.id)
-      .select("id")
-      .maybeSingle();
-    if (routeUpdateError || !updatedRoute) return null;
-
-    const standbyUnitsDispatched =
-      predictedDemand > DEMAND_THRESHOLD ? await repositionStandbyBus(signal.zone) : false;
+    const predictedDemand = Number(signalResult.predicted_demand);
+    const zone = typeof signalResult.zone === "string" ? signalResult.zone : null;
+    if (!Number.isFinite(predictedDemand) || !zone) return null;
+    const standbyUnitsDispatched = signalResult.standby_bus_dispatched === true;
 
     return {
       success: true,
       message: `${databaseSignalName} ${isActive ? "activated" : "deactivated"}.`,
-      zone: signal.zone,
+      zone,
       predictedDemand,
       standbyUnitsDispatched,
     };
@@ -114,42 +81,28 @@ export async function processCitySignal(
 
 export async function registerCommuteIntent(
   data: CommuterIntentData,
-): Promise<CommuteIntentResult> {
-  const demandKey = `${data.routeId}|${data.timeSlot}`;
-  let totalDemand: number | null = null;
-  try {
-    const { error: insertError } = await supabase.from("commuter_intent").insert({
-      phone: data.phone ?? `ANON-${Date.now()}`,
-      passenger_name: data.name ?? "Anonymous Rider",
-      user_type: data.userType,
-      route_id: data.routeId,
-      time_slot: data.timeSlot,
-    });
-    if (!insertError) {
-      const { count, error: countError } = await supabase
-        .from("commuter_intent")
-        .select("id", { count: "exact", head: true })
-        .eq("route_id", data.routeId)
-        .eq("time_slot", data.timeSlot);
-      if (!countError && typeof count === "number") totalDemand = count;
-    }
-  } catch (error) {
-    console.warn("Using local commuter intent fallback:", error);
+): Promise<CommuteIntentResult | null> {
+  const { data: intentResult, error } = await supabase.rpc("register_commute_intent", {
+    user_type: data.userType,
+    route_id: data.routeId,
+    time_slot: data.timeSlot,
+    phone: data.phone ?? "",
+  });
+  if (error || !intentResult) {
+    console.warn("Live commuter intent registration unavailable:", error);
+    return null;
   }
 
-  if (totalDemand === null) {
-    totalDemand = (localDemand.get(demandKey) ?? 0) + 1;
-    localDemand.set(demandKey, totalDemand);
-  }
-
-  const thresholdCrossed = totalDemand > DEMAND_THRESHOLD;
-  const standbyRepositioned = thresholdCrossed ? await repositionStandbyBus(data.routeId) : false;
+  const totalDemand = Number(intentResult.registration_count);
+  if (!Number.isFinite(totalDemand)) return null;
+  const thresholdCrossed = intentResult.threshold_crossed === true;
+  const standbyRepositioned = intentResult.bus_dispatched === true;
   return {
     totalDemand,
     thresholdCrossed,
     metrics: {
       totalDemand,
-      activeBusesCount: thresholdCrossed ? 2 : 1,
+      activeBusesCount: standbyRepositioned ? 2 : 1,
       routeId: data.routeId,
       timeSlot: data.timeSlot,
       activeRegistrations: totalDemand,
@@ -201,15 +154,6 @@ export async function reportConductorEvent(
       return { success: true, message: `Shift ended for ${busNumber}; bus is Unverified.` };
     }
 
-    const { data: brokenBus, error: routeLookupError } = await supabase
-      .from("buses")
-      .select("route_id")
-      .eq("bus_number", busNumber)
-      .single();
-    if (routeLookupError || !brokenBus?.route_id) {
-      throw routeLookupError ?? new Error(`No route found for bus ${busNumber}.`);
-    }
-
     const { data: updatedBreakdown, error: breakdownError } = await supabase.rpc(
       "report_bus_breakdown",
       { target_bus_number: busNumber },
@@ -221,12 +165,9 @@ export async function reportConductorEvent(
         message: `Breakdown already reported or bus ${busNumber} is not in service.`,
       };
     }
-    const standbyRepositioned = await repositionStandbyBus(brokenBus.route_id);
     return {
       success: true,
-      message: standbyRepositioned
-        ? `Breakdown reported for ${busNumber}; standby replacement repositioned.`
-        : `Breakdown reported for ${busNumber}; RTC Depot notified.`,
+      message: `Breakdown reported for ${busNumber}; standby dispatch evaluated by RTC Depot.`,
     };
   } catch (error) {
     console.error("Error reporting conductor event:", error);
